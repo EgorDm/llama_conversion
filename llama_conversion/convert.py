@@ -1115,7 +1115,8 @@ class OutputFile:
         of.fout.close()
 
     @staticmethod
-    def write_all(fname_out: Path, params: Params, file_type: GGMLFileType, model: LazyModel, vocab: Vocab) -> None:
+    def write_all(fname_out: Path, params: Params, file_type: GGMLFileType, model: LazyModel, vocab: Vocab,
+                  concurrency: int = 8) -> None:
         check_vocab_size(params, vocab)
         of = OutputFile(fname_out)
         of.write_file_header(params, file_type)
@@ -1126,7 +1127,10 @@ class OutputFile:
             name, lazy_tensor = item
             return lazy_tensor.load().to_ggml().ndarray
 
-        ndarrays = bounded_parallel_map(do_item, model.items(), concurrency=8)
+        if concurrency <= 1:
+            ndarrays = [do_item(item) for item in model.items()]
+        else:
+            ndarrays = bounded_parallel_map(do_item, model.items(), concurrency=concurrency)
         for i, ((name, lazy_tensor), ndarray) in enumerate(zip(model.items(), ndarrays)):
             size = ' x '.join(f"{dim:6d}" for dim in lazy_tensor.shape)
             padi = len(str(len(model)))
@@ -1295,6 +1299,60 @@ def do_dump_model(model_plus: ModelPlus) -> None:
         print(f"{name}: shape={lazy_tensor.shape} type={lazy_tensor.data_type}; {lazy_tensor.description}")
 
 
+def apply_lora_weight(
+        weight: np.ndarray,
+        lora_A: np.ndarray,
+        lora_B: np.ndarray,
+        scale: float,
+):
+    delta = (lora_B @ lora_A) * scale
+    return weight + delta
+
+
+LORA_PREFIX = "base_model.model."
+
+
+def apply_lora(model: LazyModel, adapter: LazyModel, scale: float) -> LazyModel:
+    def merge(name: str, lora_A_key: str, lora_B_key: str) -> LazyTensor:
+        lazy_weight = model[name].astype(DT_F16)
+        lazy_lora_A = adapter[lora_A_key].astype(DT_F16)
+        lazy_lora_B = adapter[lora_B_key].astype(DT_F16)
+
+        def load() -> UnquantizedTensor:
+            weight = load_unquantized(lazy_weight, np.float16)
+            lora_A = load_unquantized(lazy_lora_A, np.float16)
+            lora_B = load_unquantized(lazy_lora_B, np.float16)
+
+            new_weight = apply_lora_weight(weight, lora_A, lora_B, scale)
+
+            return UnquantizedTensor(new_weight)
+
+        return LazyTensor(load, model[name].shape, model[name].data_type, model[name].description)
+
+    model = {k: v for k, v in model.items()}
+    applied_layers = set()
+    for k, v in adapter.items():
+        if k in applied_layers:
+            continue
+
+        k = k.replace(LORA_PREFIX, "")
+        layer_name, suffix = k.split(".lora_")
+        layer_key = f"{layer_name}.weight"
+        lora_A_key = f"{LORA_PREFIX}{layer_name}.lora_A.weight"
+        lora_B_key = f"{LORA_PREFIX}{layer_name}.lora_B.weight"
+
+        assert layer_key in model, f"Layer {layer_key} not found in model"
+        assert lora_A_key in adapter, f"Layer {lora_A_key} not found in model"
+        assert lora_B_key in adapter, f"Layer {lora_B_key} not found in model"
+
+        applied_layers.add(lora_A_key)
+        applied_layers.add(lora_B_key)
+
+        model[layer_key] = merge(layer_key, lora_A_key, lora_B_key)
+
+    return model
+
+
 def main(args_in: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Convert a LLaMa model to a GGML compatible file")
     parser.add_argument("--dump", action="store_true",
@@ -1312,12 +1370,19 @@ def main(args_in: Optional[List[str]] = None) -> None:
                         help="directory containing model file, or model file itself (*.pth, *.pt, *.bin)")
     parser.add_argument("--vocabtype", default='spm', choices=["spm", "bpe"],
                         help="vocab format (default: spm)")
+    parser.add_argument("--lora_path", default=None, type=Path, help="path to lora binary")
+    parser.add_argument("--concurrency", default=8, type=int, help="number of threads to use")
     args = parser.parse_args(args_in)
 
     vocab: Vocab
     if args.dump_single:
         model_plus = lazy_load_file(args.model)
         do_dump_model(model_plus)
+
+        if args.lora_path is not None:
+            print(f"Loading LoRA adapter from {args.lora_path}")
+            adapter_plus = lazy_load_file(args.lora_path / "adapter_model.bin")
+            do_dump_model(adapter_plus)
     elif args.vocab_only:
         vocab = load_vocab(args.vocab_dir or args.model, args.vocabtype)
         assert args.outfile, "need --outfile if using --vocab-only"
@@ -1329,6 +1394,15 @@ def main(args_in: Optional[List[str]] = None) -> None:
         if args.dump:
             do_dump_model(model_plus)
             return
+
+        adapter_plus = None
+        if args.lora_path is not None:
+            print(f"Loading LoRA adapter from {args.lora_path}")
+            adapter_plus = load_some_model(args.lora_path / "adapter_model.bin")
+            if args.dump:
+                do_dump_model(adapter_plus)
+                return
+
         if model_plus.vocab is not None and args.vocab_dir is None:
             vocab = model_plus.vocab
         else:
@@ -1336,11 +1410,17 @@ def main(args_in: Optional[List[str]] = None) -> None:
             vocab = load_vocab(vocab_dir, args.vocabtype)
         params = Params.load(model_plus)
         model = model_plus.model
+
+        if adapter_plus is not None:
+            print("Applying LoRA adapter")
+            adapter = adapter_plus.model
+            model = apply_lora(model, adapter, scale=0.25)
+
         model = do_necessary_conversions(model, params)
         output_type = pick_output_type(model, args.outtype)
         model = convert_to_output_type(model, output_type)
         outfile = args.outfile or default_outfile(model_plus.paths, output_type)
-        OutputFile.write_all(outfile, params, output_type, model, vocab)
+        OutputFile.write_all(outfile, params, output_type, model, vocab, concurrency=args.concurrency)
         print(f"Wrote {outfile}")
 
 
