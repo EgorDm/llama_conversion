@@ -1370,7 +1370,8 @@ def main(args_in: Optional[List[str]] = None) -> None:
                         help="directory containing model file, or model file itself (*.pth, *.pt, *.bin)")
     parser.add_argument("--vocabtype", default='spm', choices=["spm", "bpe"],
                         help="vocab format (default: spm)")
-    parser.add_argument("--lora_path", default=None, type=Path, help="path to lora binary")
+    parser.add_argument("--lora_path", default=None, type=Path,
+                        help="path where adapter_model.bin is located")
     parser.add_argument("--concurrency", default=8, type=int, help="number of threads to use")
     args = parser.parse_args(args_in)
 
