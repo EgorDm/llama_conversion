@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "llama-conversion"
+version = "0.1.0"
+description = ""
+authors = ["Egor Dmitriev <egordmitriev2@gmail.com>"]
+readme = "README.md"
+packages = [{include = "llama_conversion"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+numpy = "^1.25.1"
+sentencepiece = "^0.1.99"
+
+[tool.poetry.scripts]
+llama_convert = "llama_conversion.convert:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+
+[tool.ruff]
+select = ["E", "F"]
+ignore = []
+
+exclude = [
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+    "output",
+    "data",
+]
+
+line-length = 120
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+target-version = "py310"
+
+[tool.ruff.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
